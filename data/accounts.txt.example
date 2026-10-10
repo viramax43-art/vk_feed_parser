@@ -1,0 +1,4 @@
+# phone;password;2FA_secret;proxy
+# One account per line. 2FA and proxy may be empty.
+# +79990000000;password;;
+# +79991111111;password;BASE32SECRET;http://user:pass@host:port

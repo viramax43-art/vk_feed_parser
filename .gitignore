@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+.browser-ok
+data/session*.json
+data/session*.json.bak
+data/parser.sqlite3*
+data/vk_browser_profile*/
+data/logs/
+data/exports/
+data/accounts.txt
+proxies.txt
+build/
+dist/
+*.spec
+.DS_Store
+Thumbs.db

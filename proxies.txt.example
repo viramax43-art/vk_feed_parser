@@ -1,0 +1,4 @@
+# host:port:user:pass — one line per account (same order as accounts.txt)
+# Also: login:password@ip:port or http://user:pass@host:port
+# direct / none / - — no proxy for that account
+direct

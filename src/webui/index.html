@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VK Feed Parser — панель запуска</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="rail">
+        <div class="brand">
+          <span class="brand-mark">VK</span>
+          <h1>VK&nbsp;Feed<br />Parser</h1>
+          <p>Сбор постов по хештегам: аккаунты, прокси, Excel.</p>
+        </div>
+        <nav class="nav" id="nav">
+          <button class="nav-item active" data-tab="run"><span class="idx">1</span>Прогон</button>
+          <button class="nav-item" data-tab="accounts"><span class="idx">2</span>Аккаунты</button>
+          <button class="nav-item" data-tab="tags"><span class="idx">3</span>Теги</button>
+          <button class="nav-item" data-tab="events"><span class="idx">4</span>События</button>
+        </nav>
+        <div class="rail-foot">
+          <span class="badge" id="rail-state">панель поднимается…</span>
+          <span class="rail-env" id="rail-path">—</span>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h2 id="page-title">Прогон</h2>
+            <p class="hint" id="page-hint">Выберите период и нажмите «Старт».</p>
+          </div>
+          <div class="actions">
+            <button class="btn" id="act-refresh">Обновить</button>
+            <button class="btn" id="act-validate">Проверить аккаунты</button>
+            <button class="btn" id="act-export">Excel</button>
+            <button class="btn danger" id="act-stop">Стоп</button>
+            <button class="btn primary" id="act-start">Старт</button>
+          </div>
+        </header>
+
+        <section class="cards">
+          <article class="card">
+            <span class="card-cap">Постов в базе</span>
+            <strong id="kpi-posts">—</strong>
+            <span class="card-note" id="kpi-posts-note">читаю базу…</span>
+          </article>
+          <article class="card">
+            <span class="card-cap">Теги</span>
+            <strong id="kpi-tags">—</strong>
+            <span class="card-note" id="kpi-tags-note">собрано / всего</span>
+            <div class="track"><div class="fill" id="kpi-bar"></div></div>
+          </article>
+          <article class="card">
+            <span class="card-cap">Аккаунты</span>
+            <strong id="kpi-accounts">—</strong>
+            <span class="card-note" id="kpi-accounts-note">—</span>
+          </article>
+          <article class="card">
+            <span class="card-cap">Прокси</span>
+            <strong id="kpi-proxies">—</strong>
+            <span class="card-note" id="kpi-proxies-note">из proxies.txt</span>
+          </article>
+        </section>
+
+        <section class="panel">
+          <div class="page active" id="page-run">
+            <div class="run-controls">
+              <label class="field">Период <select id="run-period"></select></label>
+              <label class="field">Проходов <input type="number" id="run-passes" min="1" max="20" step="1" /></label>
+              <label class="field">Потоков <input type="number" id="run-workers" min="1" max="64" step="1" /></label>
+              <label class="field">
+                <input type="checkbox" id="run-validate" checked /> проверить аккаунты перед стартом
+              </label>
+              <label class="field"><input type="checkbox" id="run-full" /> пройти период заново (--full)</label>
+              <label class="field"><input type="checkbox" id="run-dry" /> примерка (не писать в базу)</label>
+              <span class="run-actions">
+                <button class="btn primary" id="run-start">Старт прогона</button>
+                <button class="btn" id="run-export">Выгрузить Excel</button>
+                <button class="btn" id="run-open-exports">Папка экспорта</button>
+              </span>
+            </div>
+            <p class="run-stats" id="run-stats">—</p>
+          </div>
+
+          <div class="page" id="page-accounts">
+            <div class="toolbar">
+              <button class="btn primary" id="acc-add">Добавить аккаунты…</button>
+              <button class="btn" id="acc-edit">Изменить accounts.txt</button>
+              <button class="btn" id="acc-open">Открыть папку data</button>
+              <button class="btn" id="acc-proxies">Проверить прокси</button>
+              <button class="btn" id="acc-validate">Проверить аккаунты</button>
+            </div>
+            <div class="table-wrap">
+              <table class="table" id="acc-table"></table>
+            </div>
+          </div>
+
+          <div class="page" id="page-tags">
+            <div class="toolbar">
+              <input class="text-input" id="tag-input" placeholder="маникюр, ремонтквартир" />
+              <button class="btn primary" id="tag-add">Добавить тег</button>
+              <button class="btn" id="tag-edit">Изменить tags.txt</button>
+              <button class="btn" id="tag-open">Открыть tags.txt</button>
+            </div>
+            <div class="table-wrap">
+              <table class="table" id="tag-table"></table>
+            </div>
+          </div>
+
+          <div class="page" id="page-events">
+            <p class="run-stats">Капчи, ошибки токена и пустые выдачи — последние 40 записей.</p>
+            <div class="table-wrap">
+              <table class="table" id="event-table"></table>
+            </div>
+          </div>
+        </section>
+
+        <section class="log-wrap">
+          <div class="log-head">
+            <span>Лог процесса · <b id="log-state">ожидание</b></span>
+            <span class="log-actions">
+              <button class="btn log-copy" id="log-copy">Скопировать</button>
+              <button class="btn log-copy" id="log-clear">Очистить</button>
+            </span>
+          </div>
+          <pre class="log" id="log"></pre>
+        </section>
+
+      </main>
+    </div>
+    <div class="modal hidden" id="modal">
+      <div class="modal-box">
+        <header class="modal-head">
+          <b id="modal-title">Файл</b>
+          <button class="btn" id="modal-close">Закрыть</button>
+        </header>
+        <textarea class="editor" id="modal-text" spellcheck="false"></textarea>
+        <footer class="modal-foot">
+          <span class="card-note" id="modal-hint"></span>
+          <button class="btn primary" id="modal-save">Сохранить</button>
+        </footer>
+      </div>
+    </div>
+
+    <div class="toast hidden" id="toast"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
