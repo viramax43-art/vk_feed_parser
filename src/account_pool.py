@@ -37,7 +37,7 @@ DEAD = "dead"
 
 # Нарастающая отлёжка (сек). Короткая капча/лимит отпускает быстро,
 # затяжной flood — надолго.
-HOLD_PAUSES = (60, 300, 900, 1800, 3600)
+HOLD_PAUSES = (30, 150, 450, 900, 1800)
 
 # Как читать статусы прошлых прогонов при загрузке пула.
 _DEAD_STATUSES = {"dead", "token", "no_session", "banned"}
@@ -93,18 +93,28 @@ def _normalize_status(raw: str, cooldown_until: float, now: float) -> str:
 def load_pool_accounts(
     accounts: Iterable[Account], db: Optional[DB], proxy_override: str = ""
 ) -> list[PoolAccount]:
-    """Собирает пул из accounts.txt, накладывая статусы из базы."""
+    """Собирает пул из accounts.txt, накладывая статусы из базы.
+
+    Аккаунт без своего прокси в пул не попадает в работу: статус «нужен прокси».
+    """
     now = time.time()
     items: list[PoolAccount] = []
     for acc in accounts:
         state = db.account_state(acc.login) if db else {}
         cooldown = float(state.get("cooldown_until") or 0)
+        proxy = proxy_override or resolve_proxy(acc)
+        status = _normalize_status(state.get("status") or READY, cooldown, now)
+        reason = ""
+        if not proxy:
+            status = NEEDS_PROXY
+            reason = "нужен прокси: закрепите адрес в accounts.txt (четвёртое поле)"
         items.append(
             PoolAccount(
                 login=acc.login,
-                proxy=proxy_override or resolve_proxy(acc),
+                proxy=proxy,
                 session_path=acc.session_path,
-                status=_normalize_status(state.get("status") or READY, cooldown, now),
+                status=status,
+                reason=reason,
                 cooldown_until=cooldown if cooldown > now else 0.0,
                 fail_count=int(state.get("fail_count") or 0),
                 posts=int(state.get("total_items") or 0),
@@ -112,6 +122,10 @@ def load_pool_accounts(
             )
         )
     return items
+
+
+# Статус аккаунта без своего прокси: в работу не берётся, пока прокси не закреплён.
+NEEDS_PROXY = "needs_proxy"
 
 
 class AccountPool:
@@ -131,7 +145,16 @@ class AccountPool:
         return len(self._items)
 
     def alive(self) -> int:
-        return sum(1 for a in self._items if a.status != DEAD)
+        return sum(1 for a in self._items if a.status not in (DEAD, NEEDS_PROXY))
+
+    def items(self) -> list[PoolAccount]:
+        """Копия аккаунтов пула.
+
+        snapshot() отдаёт только статусы, а фоновому обновлению сессии нужны путь
+        к файлу сессии и прокси — они есть у самих PoolAccount.
+        """
+        with self._cv:
+            return list(self._items)
 
     def _pick(self, now: float) -> Optional[PoolAccount]:
         n = len(self._items)
@@ -230,12 +253,34 @@ class AccountPool:
 
 
 # Проверка аккаунтов (независимо от рабочих потоков)
+def _refresh_expired_token(session_path, proxy: str, use_browser: bool) -> bool:
+    """Обновляет просроченный токен: профиль браузера (лента + F5), затем cookies.
+
+    Профиль идёт первым не просто так: он заходит в ленту живой сессией и жмёт F5,
+    поэтому проходит и когда HTTP-обмен cookies VK режет («too much tries»). True — успех.
+    """
+    from vk_auth import refresh_from_cookies, refresh_via_browser
+
+    attempts = []
+    if use_browser:
+        attempts.append(refresh_via_browser)
+    attempts.append(refresh_from_cookies)
+    for fn in attempts:
+        try:
+            fn(session_path, proxy)
+            return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
 def check_account(
     acc: Account,
     proxy: str = "",
     *,
     tag: str = "",
     use_browser: bool = True,
+    _retried: bool = False,
 ) -> dict:
     """Проверяет один аккаунт: сессия, токен, users.get, при желании поиск.
 
@@ -265,7 +310,7 @@ def check_account(
     if not token_alive(data):
         attempts: list[tuple[str, Callable[[Path, str], dict]]] = []
         if use_browser:
-            attempts.append(("профиль браузера", refresh_via_browser))
+            attempts.append(("профиль браузера (F5)", refresh_via_browser))
         attempts.append(("cookies", refresh_from_cookies))
         last = "нет способов обновления"
         for name, fn in attempts:
@@ -285,6 +330,20 @@ def check_account(
         profile = validate_token(token, proxy)
     except VkApiError as exc:  # код 5/15/27/28 — токен неверный/отозванный → мёртв
         code = int(getattr(exc, "code", 0) or 0)
+        # Код 1117 VK отдаёт как «токен просрочен», но и обычный код 5 приходит с
+        # текстом «User authorization failed: access_token has expired»: токен
+        # мёртв, а cookies аккаунта и профиль браузера часто ещё живы. Поэтому
+        # один раз пробуем добыть свежий токен и проверяем снова. Раньше
+        # обновление шло только по коду 1117, и такие аккаунты падали в «мёртв —
+        # нужен вход», хотя вход был не нужен: хватало обмена cookies.
+        if code in (5, 1117) and not _retried:
+            if not _refresh_expired_token(session_path, proxy, use_browser):
+                return {**out, "status": DEAD,
+                        "reason": f"токен недействителен, обновить не удалось ({exc})"}
+            again = check_account(acc, proxy, tag=tag, use_browser=use_browser, _retried=True)
+            if again["status"] != READY:
+                again["reason"] = f"после обновления токена: {again['reason']}"
+            return again
         status = DEAD if code in (5, 15, 27, 28) else HOLD
         return {**out, "status": status, "reason": f"users.get: {exc}"}
     except Exception as exc:  # noqa: BLE001
@@ -297,6 +356,11 @@ def check_account(
             client = VkFeedClient(token, proxy, login=login)
             client.search_hashtag(tag, count=3)
         except Exception as exc:  # noqa: BLE001
+            text = str(exc).lower()
+            # VK: «User authorization failed: user is blocked» — аккаунт заблокирован,
+            # отлёжка тут не поможет и только маскирует проблему.
+            if "blocked" in text or "заблок" in text:
+                return {**out, "status": DEAD, "reason": f"заблокирован VK: {exc}"}
             return {**out, "status": HOLD, "reason": f"поиск не прошёл: {exc}"}
 
     user = f"{profile.get('first_name', '')} {profile.get('last_name', '')}".strip()
@@ -350,6 +414,8 @@ def validate_accounts(
                     status=res["status"],
                     error="" if res["status"] == READY else res["reason"],
                     touch_ok=res["status"] == READY,
+                    cooldown_until=(time.time() + HOLD_PAUSES[0])
+                    if res["status"] == HOLD else None,
                 )
             if on_result:
                 on_result(res)

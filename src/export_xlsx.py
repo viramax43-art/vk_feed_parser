@@ -21,7 +21,7 @@ from paths import EXPORTS_DIR  # noqa: E402
 from state_db import DB  # noqa: E402
 
 COLUMNS = [
-    ("tag", "Тег", 18),
+    ("tag", "Теги", 22),
     ("date_str", "Дата", 20),
     ("author_name", "Автор", 26),
     ("author_kind", "Тип", 8),
@@ -127,7 +127,7 @@ def export_posts(
         )
 
     workbook.close()
-    print(f"выгружено постов: {len(rows)} → {path}")
+    print(f"выгружено постов: {len(rows)} (один пост = одна строка) → {path}")
     return path
 
 

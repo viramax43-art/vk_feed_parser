@@ -3,10 +3,17 @@
 
     python3 start_panel.py              # поднять панель (первый раз может создать .venv)
     python3 start_panel.py --port 9000  # другой порт
+    python3 start_panel.py --host 0.0.0.0   # сервер: панель доступна по сети
     python3 start_panel.py --skip-browser-install   # не проверять Chromium
 
 Скрипт нужен обычному человеку: он сам найдёт Python с нужными пакетами, при
 необходимости поставит их в .venv, потом запустит src/webui.py — панель в браузере.
+
+Windows: двойной клик по «Запустить панель.bat».
+macOS: двойной клик по «Запустить панель.command».
+Linux/сервер: bash start_panel.sh (перед первым запуском: chmod +x start_panel.sh).
+Скрипт сам определяет систему: путь к python в .venv (Scripts/python.exe или bin/python),
+поиск интерпретатора (py/ python3.x) и подсказки по системным библиотекам Chromium.
 """
 from __future__ import annotations
 
@@ -66,7 +73,7 @@ def candidates() -> list[list[str]]:
 
 def run_capture(cmd: list[str], code: str) -> Optional[str]:
     try:
-        done = subprocess.run([*cmd, "-c", code], capture_output=True, text=True, timeout=25)
+        done = subprocess.run([*cmd, "-c", code], capture_output=True, text=True, timeout=12)
     except (OSError, subprocess.SubprocessError):
         return None
     if done.returncode != 0:
@@ -108,6 +115,11 @@ def install_chromium(cmd: list[str]) -> None:
         return
     say("Chromium не установился (нет интернета?). Потом можно повторить:")
     say(f"  {' '.join(cmd)} -m playwright install chromium")
+    if os.name != "nt":
+        # На сервере браузеру нужны системные библиотеки, а под root — --no-sandbox
+        # (его проект добавляет сам).
+        say("  Linux/сервер: sudo python3 -m playwright install --with-deps chromium")
+        say("  или системный браузер: sudo apt install chromium (проект найдёт его сам)")
 
 
 def usable(cmd: list[str]) -> bool:
@@ -162,10 +174,23 @@ def ensure_python() -> list[str]:
     return venv_cmd
 
 
+def display_note() -> None:
+    """Сервер без графики: панель поднимется, но вход в браузере требует экрана."""
+    if os.name == "nt" or sys.platform == "darwin":
+        return
+    if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY") or "").strip():
+        return
+    say("Графической сессии нет (сервер или ssh) — это нормально для панели:")
+    say("  панель открывайте по адресу из строки ниже (или пробросьте порт: ssh -L 8787:127.0.0.1:8787 …),")
+    say("  а вход в VK делайте токеном LOGIN:PASS:TOKEN в data/accounts.txt или так:")
+    say("  xvfb-run -a python3 src/vk_auth.py --login")
+
+
 def main() -> int:
     args = [arg for arg in sys.argv[1:] if arg != "--skip-browser-install"]
     python = ensure_python()
     say("Запускаю панель… браузер откроется сам, адрес будет в строке ниже.")
+    display_note()
     return subprocess.call([*python, str(BASE_DIR / "src" / "webui.py"), *args])
 
 

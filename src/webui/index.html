@@ -43,7 +43,7 @@
 
         <section class="cards">
           <article class="card">
-            <span class="card-cap">Постов в базе</span>
+            <span class="card-cap" id="kpi-posts-cap">Постов в базе</span>
             <strong id="kpi-posts">—</strong>
             <span class="card-note" id="kpi-posts-note">читаю базу…</span>
           </article>
@@ -69,29 +69,47 @@
           <div class="page active" id="page-run">
             <div class="run-controls">
               <label class="field">Период <select id="run-period"></select></label>
+              <label class="field" title="Сколько часов РАБОТАТЬ, считая от «Старт»: процесс непрерывно добирает новые посты, пока время не выйдет. Заполняется по периоду (до 24 ч). 0 — один проход.">Работать, ч <input type="number" id="run-duty" min="0" max="720" step="1" /></label>
+              <label class="field" title="Как часто проверять, не появились ли новые посты.">Пауза, с <input type="number" id="run-pause" min="10" max="3600" step="10" /></label>
               <label class="field">Проходов <input type="number" id="run-passes" min="1" max="20" step="1" /></label>
               <label class="field">Потоков <input type="number" id="run-workers" min="1" max="64" step="1" /></label>
               <label class="field">
                 <input type="checkbox" id="run-validate" checked /> проверить аккаунты перед стартом
               </label>
-              <label class="field"><input type="checkbox" id="run-full" /> пройти период заново (--full)</label>
+              <label class="field"><input type="checkbox" id="run-full" /> перепроверить весь период (--full)</label>
+              <label class="field"><input type="checkbox" id="run-nofresh" /> не перепроверять собранные часы (--no-refresh)</label>
               <label class="field"><input type="checkbox" id="run-dry" /> примерка (не писать в базу)</label>
+              <label class="field" title="Сам обход ленты идёт HTTP-запросами (newsfeed.search) — браузера в нём нет, а эмулятор браузера (профиль ленты + F5) работает скрыто. Галочка включает показ: открывается окно обхода — та же выдача по тегу, что берёт прогон (с # или без # — как выбрано на странице «Теги»), с подписью, какое окно времени обходится прямо сейчас (живёт весь прогон и закрывается с его концом), — а эмулятор мелькает в своём окне, когда освежает сессию через F5 и меняет cookies на свежий токен. Нужна графическая сессия; на сервере без экрана галочка ничего не даст."><input type="checkbox" id="run-showbrowser" /> показывать браузер (обход ленты + F5)</label>
               <span class="run-actions">
                 <button class="btn primary" id="run-start">Старт прогона</button>
                 <button class="btn" id="run-export">Выгрузить Excel</button>
                 <button class="btn" id="run-open-exports">Папка экспорта</button>
               </span>
             </div>
+            <p class="card-note">Период — это <b>что</b> собирать, а не сколько работать: «за 6 часов» на уже собранных часах пролетает за минуту, и прогон сразу заканчивается. Сколько <b>работать</b> — поле «Работать, ч»: оно подставляется по периоду и считается от нажатия «Старт» (например «за 6 часов» → работать 6 ч: сначала период, потом каждые «Пауза, с» — новые посты). 0 — один проход: закончить, как только период собран. Долгий период («за 30 суток») — это сотни окон: прогон идёт порциями, теги по кругу, и останавливается, когда период собран целиком. Свежие часы периода каждый заход перепроверяются: лента меняется — приходят запоздавшие посты, обновляются лайки. Сколько именно часов перепроверять — <code>refresh_tail_hours</code> в <code>data/settings.json</code> (0 — выключить).</p>
             <p class="run-stats" id="run-stats">—</p>
           </div>
 
           <div class="page" id="page-accounts">
             <div class="toolbar">
               <button class="btn primary" id="acc-add">Добавить аккаунты…</button>
+              <button class="btn" id="acc-proxies-add">Добавить прокси пачкой…</button>
+              <button class="btn" id="acc-proxies-bind">Привязать свободные прокси</button>
               <button class="btn" id="acc-edit">Изменить accounts.txt</button>
               <button class="btn" id="acc-open">Открыть папку data</button>
               <button class="btn" id="acc-proxies">Проверить прокси</button>
               <button class="btn" id="acc-validate">Проверить аккаунты</button>
+              <button class="btn primary" id="acc-login-all">Войти во все, кому нужен вход</button>
+            </div>
+            <div class="toolbar">
+              <span class="card-note">Показать:</span>
+              <button class="btn primary" data-acc-filter="all">Все</button>
+              <button class="btn" data-acc-filter="ready">Работают</button>
+              <button class="btn" data-acc-filter="dead">Мёртвые</button>
+              <button class="btn" id="acc-select-all">Выбрать все видимые</button>
+              <span style="flex:1"></span>
+              <button class="btn danger" id="acc-del-selected">Удалить выбранные</button>
+              <button class="btn danger" id="acc-del-dead">Удалить все мёртвые</button>
             </div>
             <div class="table-wrap">
               <table class="table" id="acc-table"></table>
@@ -104,7 +122,10 @@
               <button class="btn primary" id="tag-add">Добавить тег</button>
               <button class="btn" id="tag-edit">Изменить tags.txt</button>
               <button class="btn" id="tag-open">Открыть tags.txt</button>
+              <label class="field" title="Чем искать тег в запросе к VK. «с #» — посты с этим хештегом (#тег, как было всегда). «без #» — посты, где тег встречается в тексте словом. «авто» — по каждому тегу сам: где выдача больше, тот запрос и берётся (выбор запоминается в базе, чтобы не тратить пробные запросы). У VK это ДВЕ РАЗНЫЕ выдачи, поэтому выбирайте под задачу. Настройка сохраняется в data/settings.json (tag_query) и её можно задать флагом --tag-query.">Искать тег <select id="tag-query"><option value="hash">с # (хештег)</option><option value="word">без # (слово)</option><option value="auto">авто (по тегу)</option></select></label>
             </div>
+            <p class="card-note">«с #» — посты с хештегом (<code>#маникюр</code>), «без #» — посты, где тег встречается в тексте словом (<code>маникюр</code>). Это <b>разные</b> выдачи VK, и выбранный режим применяется ко всему прогону и к окну обхода ленты.</p>
+            <p class="card-note">В строке тега две кнопки: <b>«В очередь»</b> возвращает тег к сбору — статус и курсор сбрасываются, собранные посты остаются в базе; <b>«Обнулить счётчики»</b> обнуляет цифры «Постов/Страниц/Проходов» и карточку <b>«Постов в базе»</b> (она начинает считать с нуля; статус и курсор тега не меняются, посты из базы не удаляются).</p>
             <div class="table-wrap">
               <table class="table" id="tag-table"></table>
             </div>

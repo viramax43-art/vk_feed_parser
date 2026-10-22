@@ -1,4 +1,10 @@
 curl_cffi==0.7.4
 playwright>=1.48.0
 xlsxwriter==3.2.9
+pyotp>=2.9.0
 # после установки: python -m playwright install chromium
+# На Linux-сервере браузеру нужны системные библиотеки:
+#   sudo python3 -m playwright install --with-deps chromium
+# Окно-приложение (pywebview) нужно только exe-сборке Windows — на Linux его не тянем:
+# панель там работает в браузере. Если окно нужно, поставьте вручную: pip install pywebview
+pywebview>=5.0; sys_platform != "linux"

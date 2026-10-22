@@ -98,10 +98,19 @@ def settings_menu() -> None:
         "repeat_passes": "повторных проходов по тегу",
         "repeat_pause_sec": "пауза между проходами, с",
         "request_pause_sec": "пауза между запросами, с",
+        "min_call_gap_sec": "мин. интервал между запросами аккаунта, с",
+        "max_call_gap_sec": "макс. интервал между запросами аккаунта, с",
+        "dedupe_posts": "дубли по тексту: off / tag / global",
+        "min_text_chars": "мин. осмысленных знаков в тексте (0 — выкл.)",
+        "tag_query": "чем искать тег: hash (с #) / word (без #)",
         "export_interval_sec": "живой экспорт каждые, с",
         "stop_when_no_new_pages": "стоп после N страниц без новых",
         "default_days": "период по умолчанию, суток",
         "window_hours": "размер окна времени, ч",
+        "refresh_tail_hours": "свежие часы периода перепроверять, ч (0 — выкл.)",
+        "session_refresh_minutes": "менять токен аккаунтов каждые, мин (0 — выкл.)",
+        "auto_login_on_fail": "панели самой открывать вход, если прогон встал: on / off",
+        "show_browser": "показывать окно браузера-эмулятора (лента + F5): on / off",
         "job_attempts": "попыток на окно при ошибках",
     }
     for key, label in fields.items():
@@ -111,7 +120,7 @@ def settings_menu() -> None:
         try:
             settings[key] = float(raw) if "." in raw else int(raw)
         except ValueError:
-            print("   не число — пропущено")
+            settings[key] = raw  # строки вроде dedupe_posts: off / tag / global
     save_settings(settings)
     print("сохранено:", json.dumps(load_settings(), ensure_ascii=False))
 

@@ -87,7 +87,8 @@ def ensure_layout() -> None:
     if not ACCOUNTS_FILE.exists():
         ACCOUNTS_FILE.write_text(
             "# телефон;пароль;2FA_СЕКРЕТ;прокси (host:port:user:pass)\n"
-            "# логин = номер телефона в формате +7XXXXXXXXXX\n"
+            "# или LOGIN:PASS:TOKEN (токен vk1.a.… → сразу session_*.json)\n"
+            "# логин = номер телефона (+7… или без плюса)\n"
             "# прокси необязателен: если пусто — берётся прокси из proxies.txt\n",
             encoding="utf-8",
         )

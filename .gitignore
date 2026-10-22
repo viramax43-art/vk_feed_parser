@@ -10,8 +10,19 @@ data/logs/
 data/exports/
 data/accounts.txt
 proxies.txt
+data/proxy_stock.txt
 build/
 dist/
 *.spec
 .DS_Store
 Thumbs.db
+
+# Локальные копии правок и архивы (в git не нужны)
+*.bak
+*.zip
+_tmp*
+apply_*.py
+diagnose_patch.py
+.tmp-route/
+src/fix.py
+

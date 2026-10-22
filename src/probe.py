@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Проба одного хештега: newsfeed.search + запись в SQLite.
+"""Проба одного тега: newsfeed.search + запись в SQLite.
 
 Запуск:
     python src/probe.py маникюр --pages 5 --count 50
@@ -8,6 +8,12 @@
     python src/probe.py маникюр --passes 3 --repeat-pause 30    # повторные проходы
     python src/probe.py маникюр --json                          # сырой ответ VK
     python src/probe.py маникюр --dry-run                       # без записи в базу
+    python src/probe.py маникюр --tag-query word                # искать словом, без #
+
+Чем искать тег — хештегом (#тег) или словом без решётки — режим tag_query из
+data/settings.json (страница «Теги» в панели); флаг --tag-query перебивает настройку.
+В режиме «авто» проба один раз спрашивает обе выдачи за сутки и берёт ту, где постов
+больше (в прогоне так же — по каждому тегу отдельно, см. run_tags.tag_mode_for).
 """
 from __future__ import annotations
 
@@ -23,15 +29,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from accounts import load_accounts, normalize_proxy, resolve_proxy  # noqa: E402
 from paths import LOG_DIR, SESSION_FILE  # noqa: E402
-from settings import load_settings  # noqa: E402
+from settings import TAG_QUERY_LABELS, load_settings  # noqa: E402
 from state_db import DB  # noqa: E402
 from vk_client import (  # noqa: E402
+    MAX_RESULTS,
+    MODE_PROBE_HOURS,
     VkApiError,
     VkAuthError,
     VkCaptchaError,
     VkFeedClient,
     VkTokenError,
+    detect_tag_mode,
     extract_tag,
+    set_tag_query,
 )
 
 
@@ -102,6 +112,8 @@ def run_tag(
         "status": "finished",
         "reason": "end_of_feed",
         "cursor": "",
+        "dupes": 0,
+        "junk": 0,
     }
     cursor = ""
     if resume and db is not None:
@@ -150,7 +162,7 @@ def run_tag(
             summary["pages"] += 1
             summary["seen"] += len(items)
             if items and not dry_run and db is not None:
-                fresh = db.add_posts(items, tag, pass_no=pass_no, page=page_no)
+                fresh = db.add_posts(items, tag, pass_no=pass_no, page=page_no, stats=summary)
             else:
                 fresh = len(items)
             summary["new"] += max(0, fresh)
@@ -219,26 +231,36 @@ def run_window(
     round_no: int = 1,
     seen_before: int = 0,
     split_if_seen: int = 30,
+    mode: Optional[str] = None,
 ) -> dict:
     """Листает одно окно [start_time, end_time) тега до конца ленты.
+
+    `mode` — чем искать тег в этом окне ("hash"/"word"; None — общий режим прогона):
+    авто-режим передаёт сюда выбор по каждому тегу (см. run_tags.tag_mode_for).
 
     Возвращает сводку; need_split=True — VK отдал меньше, чем нашёл (упёрлись в
     лимит выдачи) или кончились страницы: окно надо дробить. on_page(cursor,
     seen, new) вызывается после каждой страницы, чтобы сохранить курсор и
     продолжить окно после падения.
+
+    Глубже первых MAX_RESULTS (1000) записей newsfeed.search не отдаёт: страницы
+    начинают повторяться или приходят пустыми. Поэтому окно, дошедшее до 1000,
+    сразу помечается need_split — по времени его добьют половинки, а не
+    потерянный остаток (см. run_tags.split_job).
     """
     tag = extract_tag(tag)
     out = {
         "status": "ok", "reason": "end_of_feed", "pages": 0, "seen": 0,
         "new": 0, "total": 0, "cursor": cursor or "", "need_split": False,
         "oldest": 0,  # дата самого старого полученного поста — граница остатка окна
+        "dupes": 0, "junk": 0,  # сколько постов не записали (повторы/мусор)
     }
     empty_streak = 0
     while out["pages"] < max(1, max_pages):
         try:
             result = client.search_hashtag(
                 tag, count=count, start_from=out["cursor"] or None,
-                start_time=start_time, end_time=end_time,
+                start_time=start_time, end_time=end_time, mode=mode,
             )
         except VkTokenError:
             return {**out, "status": "error", "reason": "token"}
@@ -259,7 +281,7 @@ def run_window(
             out["total"] = int(result.get("total") or 0)
         fresh = 0
         if items and db is not None and not dry_run:
-            fresh = db.add_posts(items, tag, pass_no=round_no, page=out["pages"])
+            fresh = db.add_posts(items, tag, pass_no=round_no, page=out["pages"], stats=out)
             db.bump_tag(tag, items=len(items), pages=1)
         elif items:
             fresh = len(items)
@@ -270,6 +292,14 @@ def run_window(
         out["cursor"] = result.get("next_from") or ""
         if on_page:
             on_page(out["cursor"], len(items), fresh)
+
+        # VK не отдаёт глубже первых 1000 результатов (даже с offset/start_from):
+        # следующие страницы повторяют уже отданное или приходят пустыми. Дальше
+        # листать бессмысленно — окно делим по времени, половинки доберут остаток.
+        if out["seen"] >= MAX_RESULTS:
+            out["reason"] = "capped"
+            out["need_split"] = True
+            return out
 
         if not out["cursor"]:
             break
@@ -312,6 +342,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--proxy", default="")
     parser.add_argument("--token", default="")
     parser.add_argument("--pause", type=float, default=0.0)
+    parser.add_argument(
+        "--tag-query",
+        choices=("hash", "word", "auto"),
+        default=None,
+        help="чем искать тег: hash — с решёткой (#тег, как было), word — словом без "
+             "решётки (посты, где тег встречается в тексте), auto — выбрать по тегу "
+             "пробными запросами. По умолчанию — из data/settings.json (tag_query, "
+             "страница «Теги»)",
+    )
     parser.add_argument("--no-resume", action="store_true", help="игнорировать курсор из базы")
     parser.add_argument("--dry-run", action="store_true", help="не писать в базу")
     parser.add_argument("--json", action="store_true", help="сохранить сырой ответ первой страницы")
@@ -340,6 +379,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         f"старт: тег={args.tag}, страниц={pages}, по {count}, проходов={passes}, "
         f"пауза {pause} с, с {start_time or '—'} по {end_time or '—'}"
     )
+    # Чем искать тег — решает настройка tag_query (страница «Теги»); флаг перебивает
+    # её. Режим ставим до первого запроса; «авто» разрешается ниже пробой по тегу.
+    mode = set_tag_query(args.tag_query if args.tag_query is not None else settings["tag_query"])
+    log(f"тег в запросе: {TAG_QUERY_LABELS[mode]}")
     try:
         client = build_client(args)
     except VkAuthError as exc:
@@ -347,7 +390,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         log("сначала выполните вход: python src/vk_auth.py --login")
         return 1
     log(f"сессия: {client.login or '—'}, прокси: {client.proxy or '—'}")
-    db = None if args.dry_run else DB()
+    if mode == "auto":
+        # Авто-режим: проба одного тега — самое место проверить оба запроса и
+        # показать, где выдача больше (в прогоне это делает run_tags.tag_mode_for).
+        clean = extract_tag(args.tag)
+        try:
+            mode, hash_items, word_items = detect_tag_mode(client, clean)
+        except Exception as exc:  # noqa: BLE001 — проба не должна валить запуск
+            log(f"режим тега не определился ({type(exc).__name__}: {exc}) — ищу хештегом")
+            mode = set_tag_query("hash")
+        else:
+            mode = set_tag_query(mode)
+            log(
+                f"#{clean}: за {MODE_PROBE_HOURS} ч хештегом {hash_items}, словом "
+                f"{word_items} — ищу {'словом' if mode == 'word' else 'хештегом'}"
+            )
+    db = None if args.dry_run else DB(
+        dedupe=settings["dedupe_posts"], min_text_chars=settings["min_text_chars"]
+    )
     summary = run_tag(
         client,
         db,

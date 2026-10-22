@@ -15,9 +15,14 @@ VK через этот прокси). Код выхода 1, если хоть �
 прокси вообще; --browser — реальный Chromium через прокси (то же, что делает вход в
 VK); direct (или none/-) вместо адреса — контрольная проверка без прокси.
 
-Скрипт предупреждает, если в Windows включён системный прокси: трафик идёт через
+Скрипт предупреждает, если включён системный прокси (Windows — реестр, Linux —
+переменные окружения или настройки GNOME): трафик (в т.ч. Chromium и curl) идёт через
 VPN/TUN, и RU-прокси с авторизацией по IP молча дропают запросы (TCP открывается в
 туннеле, а данных нет) — выключите VPN и повторите проверку.
+
+Режим --browser ищет браузер так же, как вход в VK: каналы Edge/Chrome, встроенный
+Chromium, системные Chrome/Chromium (см. platform_compat) — поэтому проверка работает и
+на Linux-сервере. Под root автоматически добавляется --no-sandbox.
 """
 from __future__ import annotations
 
@@ -36,6 +41,13 @@ from accounts import (  # noqa: E402
     proxy_host_port,
     proxies_from_file,
     resolve_proxy,
+)
+from platform_compat import (  # noqa: E402
+    browser_args,
+    browser_launch_attempts,
+    browser_missing_hint,
+    proxy_warning,
+    system_proxy,
 )
 
 IP_URL = "https://api.ipify.org?format=json"
@@ -59,27 +71,12 @@ def log(msg: str) -> None:
 
 
 def system_proxy_state() -> str:
-    """Адрес системного прокси Windows (VPN/TUN): влияет на Chromium и curl."""
-    if sys.platform != "win32":
-        return ""
-    try:
-        import winreg
+    """Адрес системного прокси (VPN/TUN): влияет на Chromium и curl.
 
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-        ) as key:
-            enabled = winreg.QueryValueEx(key, "ProxyEnable")[0]
-            server = winreg.QueryValueEx(key, "ProxyServer")[0]
-            try:
-                auto = winreg.QueryValueEx(key, "AutoConfigURL")[0]
-            except OSError:
-                auto = ""
-    except OSError:
-        return ""
-    if enabled and server:
-        return str(server)
-    return str(auto or "")
+    Windows — реестр; Linux — переменные окружения или настройки GNOME;
+    macOS — переменные окружения. Логика в platform_compat.
+    """
+    return system_proxy()
 
 
 def _body(resp) -> dict:
@@ -89,7 +86,7 @@ def _body(resp) -> dict:
         return {}
 
 
-def check_proxy(raw: str, timeout: float = 30.0) -> dict:
+def check_proxy(raw: str, timeout: float = 15.0) -> dict:
     """Возвращает словарь-отчёт по одному прокси."""
     from vk_auth import _http_session  # локальный импорт: не тянем playwright при --help
 
@@ -148,7 +145,7 @@ def check_proxy(raw: str, timeout: float = 30.0) -> dict:
     return report
 
 
-def raw_probe(raw: str, timeout: float = 15.0, target: str = "api.vk.com:443") -> dict:
+def raw_probe(raw: str, timeout: float = 8.0, target: str = "api.vk.com:443") -> dict:
     """Сокетная проверка: открыт ли порт и отвечает ли прокси на запросы."""
     import base64
     import socket
@@ -258,7 +255,7 @@ def print_raw_report(report: dict, index: int = 0, total: int = 0) -> None:
     )
 
 
-def browser_probe(raw: str, url: str = IP_URL, timeout: float = 40.0) -> dict:
+def browser_probe(raw: str, url: str = IP_URL, timeout: float = 20.0) -> dict:
     """Открывает настоящий Chromium через прокси — как при входе в VK."""
     proxy = normalize_proxy(raw)
     report = {
@@ -276,13 +273,25 @@ def browser_probe(raw: str, url: str = IP_URL, timeout: float = 40.0) -> dict:
         report["error"] = f"нужен playwright: {exc}"
         return report
 
-    launch: dict = {"headless": True, "args": ["--disable-blink-features=AutomationControlled"]}
+    launch: dict = {"headless": True, "args": browser_args()}
     pw_proxy = proxy_to_playwright(proxy)
     if pw_proxy:
         launch["proxy"] = pw_proxy
+    attempt_error = ""
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(**launch)
+            browser = None
+            # Браузер ищем так же, как при входе в VK: каналы, встроенный
+            # Chromium, системные Chrome/Chromium (см. platform_compat).
+            for attempt in browser_launch_attempts():
+                try:
+                    browser = pw.chromium.launch(**attempt, **launch)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    attempt_error = str(exc).splitlines()[0][:200]
+            if browser is None:
+                report["error"] = browser_missing_hint(attempt_error, "повторите проверку")
+                return report
             try:
                 page = browser.new_page()
                 page.set_default_timeout(int(timeout * 1000))
@@ -310,6 +319,12 @@ def load_targets(args) -> list[str]:
     """Список прокси для проверки: --proxy, аккаунт или пул из proxies.txt."""
     if args.proxy:
         return ["" if p.strip().lower() in DIRECT_ALIASES else p for p in args.proxy]
+    if args.all_accounts:
+        # проверяем прокси каждого аккаунта: у всех свой адрес или общий
+        accounts = load_accounts()
+        if not accounts:
+            raise SystemExit("нет аккаунтов в data/accounts.txt")
+        return [resolve_proxy(acc) for acc in accounts]
     if args.account:
         accounts = load_accounts()
         if not accounts:
@@ -333,11 +348,32 @@ def print_report(report: dict, index: int = 0, total: int = 0) -> None:
     )
 
 
+def _report_shared_ips(reports: list[dict]) -> None:
+    """Один IP на несколько аккаунтов — VK связывает их между собой."""
+    by_ip: dict[str, list[str]] = {}
+    for report in reports:
+        ip = str(report.get("ip") or "").strip()
+        if ip:
+            by_ip.setdefault(ip, []).append(str(report.get("proxy") or "—"))
+    shared = {ip: items for ip, items in by_ip.items() if len(items) > 1}
+    if not shared:
+        log("общих IP между аккаунтами нет — по адресам аккаунты не связаны")
+        return
+    log(f"ВНИМАНИЕ: {len(shared)} IP делят несколько аккаунтов — VK связывает такие аккаунты:")
+    for ip, items in shared.items():
+        log(f"  {ip}: {len(items)} аккаунта ({', '.join(items[:5])})")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Проверка прокси для VK")
     parser.add_argument("--proxy", action="append", default=[], help="прокси (можно несколько раз)")
     parser.add_argument("--account", type=int, default=0, help="взять прокси аккаунта из accounts.txt")
-    parser.add_argument("--timeout", type=float, default=30.0, help="таймаут запроса, сек")
+    parser.add_argument("--timeout", type=float, default=15.0, help="таймаут запроса, сек")
+    parser.add_argument(
+        "--all-accounts",
+        action="store_true",
+        help="проверить прокси каждого аккаунта и найти общие адреса",
+    )
     parser.add_argument("--json", action="store_true", help="вывести отчёт в JSON")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--raw", action="store_true", help="сокетная диагностика (TCP/CONNECT/HTTP)")
@@ -349,24 +385,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.json:
         sys_proxy = system_proxy_state()
         if sys_proxy:
-            log(
-                f"внимание: в Windows включён системный прокси {sys_proxy} — "
-                "трафик (в т.ч. Chromium и curl) идёт через VPN/TUN; "
-                "RU-прокси с авторизацией по IP могут молча дропать такие запросы"
-            )
+            log(proxy_warning(sys_proxy))
     if not targets:
         log("нечего проверять: proxies.txt пуст (или передайте --proxy)")
         return 1
     reports: list[dict] = []
     for idx, raw in enumerate(targets, start=1):
         if args.raw:
-            report = raw_probe(raw, timeout=min(args.timeout, 20.0))
+            report = raw_probe(raw, timeout=min(args.timeout, 10.0))
             reports.append(report)
             if not args.json:
                 print_raw_report(report, idx, len(targets))
             continue
         if args.browser:
-            report = browser_probe(raw, timeout=max(args.timeout, 40.0))
+            report = browser_probe(raw, timeout=max(args.timeout, 20.0))
             reports.append(report)
             if not args.json:
                 print_browser_report(report, idx, len(targets))
@@ -379,6 +411,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.json:
         print(json.dumps(reports, ensure_ascii=False, indent=2))
 
+    if args.all_accounts and not args.json:
+        _report_shared_ips(reports)
     alive = [r for r in reports if (raw_ok(r) if args.raw else r["ok"])]
     if not args.json:
         log(f"итого: рабочих {len(alive)} из {len(reports)}")

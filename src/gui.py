@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import queue
+import shutil
 import signal
 import subprocess
 import sys
@@ -27,7 +28,11 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from account_pool import DEAD, HOLD, READY, normalize_status, status_label  # noqa: E402
-from accounts import load_accounts, parse_account_line  # noqa: E402
+from accounts import (  # noqa: E402
+    load_accounts,
+    parse_account_line,
+    upsert_accounts,
+)
 from paths import (  # noqa: E402
     ACCOUNTS_FILE,
     BASE_DIR,
@@ -37,8 +42,15 @@ from paths import (  # noqa: E402
     ensure_layout,
     invoke_cmd,
 )
-from settings import load_settings, save_settings  # noqa: E402
+from settings import (  # noqa: E402
+    TAG_QUERY_LABELS,
+    load_settings,
+    normalize_tag_query,
+    save_settings,
+    tag_query_value,
+)
 from state_db import DB  # noqa: E402
+from platform_compat import IS_MACOS, IS_WINDOWS  # noqa: E402
 
 POLL_MS = 1000  # период опроса базы
 REFRESH_EVERY = 3  # события обновляем реже, чем статусы
@@ -55,6 +67,14 @@ PERIODS: list[tuple[str, float]] = [
     ("за 7 суток", 168.0),
     ("за 30 суток", 720.0),
 ]
+
+# «Работать, ч» подставляется по выбранному периоду: «за 6 часов» → работать 6 ч от
+# «Старт» (период — это ЧТО собирать, а не сколько работать). Дольше суток по умолчанию
+# не подставляем: «за 30 суток» — это сбор истории, а не месяц работы. Кому надо
+# иначе — правит поле после выбора периода; 0 — один проход, как раньше.
+AUTO_DUTY_HOURS = {
+    label: ("0" if hours <= 0 else f"{min(hours, 24.0):g}") for label, hours in PERIODS
+}
 
 TAG_LABELS = {"pending": "в очереди", "running": "идёт", "finished": "собрано"}
 EVENT_LEVELS = {"info": "инфо", "warn": "внимание", "error": "ошибка"}
@@ -208,38 +228,43 @@ def configure_style() -> None:
     )
 
 # Логика без окон: её проверяют тесты, поднимать Tk для этого не нужно
-def open_path(path: Path) -> None:
-    """Открывает файл или папку системным приложением."""
+def open_path(path: Path) -> bool:
+    """Открывает файл или папку системным приложением.
+
+    False — открыть нечем: на сервере без графики (Linux, ssh) панель покажет путь
+    текстом, а не сделает вид, что всё открылось.
+    """
     path = Path(path)
     try:
-        if sys.platform.startswith("win"):
+        if IS_WINDOWS:
             os.startfile(str(path))  # type: ignore[attr-defined]
-        elif sys.platform == "darwin":
+        elif IS_MACOS:
             subprocess.Popen(["open", str(path)])
         else:
-            subprocess.Popen(["xdg-open", str(path)])
+            opener = shutil.which("xdg-open")
+            if not opener:
+                return False
+            subprocess.Popen([opener, str(path)])
     except Exception:  # noqa: BLE001
-        pass
+        return False
+    return True
 
 
-def parse_accounts_text(text: str) -> tuple[list[str], list[str]]:
-    """Разбирает вставленные строки аккаунтов: (годные строки, проблемы).
-
-    Комментарии сохраняем как есть, кривые строки не пишем и говорим, что не так.
-    """
-    keep: list[str] = []
+def parse_accounts_text(text: str) -> tuple[list, list[str]]:
+    """Разбирает вставленные строки: (список Account, проблемы)."""
+    keep: list = []
     bad: list[str] = []
     for i, raw in enumerate((text or "").splitlines(), 1):
         line = raw.strip().lstrip("\ufeff")
-        if not line:
+        if not line or line.startswith("#") or line.startswith("//"):
             continue
-        if line.startswith("#") or line.startswith("//"):
-            keep.append(line)
+        acc = parse_account_line(line, i)
+        if acc is None:
+            bad.append(
+                f"строка {i}: нужен «телефон;пароль;2FA;прокси» или «LOGIN:PASS:TOKEN» — {line}"
+            )
             continue
-        if parse_account_line(line, i) is None:
-            bad.append(f"строка {i}: не похоже на «телефон;пароль;2FA;прокси» — {line}")
-        else:
-            keep.append(line)
+        keep.append(acc)
     return keep, bad
 
 
@@ -289,10 +314,15 @@ def build_run_args(
     workers: int = 0,
     validate_first: bool = True,
     full: bool = False,
+    no_refresh: bool = False,
     no_resume: bool = False,
     dry_run: bool = False,
+    run_hours: float = 0.0,
+    repeat_pause: int = 0,
     tags_file: Optional[Path] = None,
     tag: str = "",
+    show_browser: bool = False,
+    tag_query: str = "",
 ) -> list[str]:
     """Аргументы для run_tags.py — ровно то, что уйдёт в процесс."""
     args: list[str] = []
@@ -300,16 +330,30 @@ def build_run_args(
         args += ["--hours", f"{float(hours):g}"]
     if passes and int(passes) > 1:
         args += ["--passes", str(int(passes))]
+    if run_hours and float(run_hours) > 0:
+        # Работа на время: период — это что собирать, а сколько работать задаёт этот флаг.
+        args += ["--run-hours", f"{float(run_hours):g}"]
+    if repeat_pause and int(repeat_pause) > 0:
+        args += ["--repeat-pause", str(int(repeat_pause))]
     if workers:
         args += ["--workers", str(int(workers))]
     if validate_first:
         args.append("--validate-first")
     if full:
         args.append("--full")
+    if no_refresh:
+        args.append("--no-refresh")
     if no_resume:
         args.append("--no-resume")
     if dry_run:
         args.append("--dry-run")
+    if show_browser:
+        # Окно браузера-эмулятора на виду: видно, как он обновляет ленту через F5.
+        args.append("--show-browser")
+    if tag_query:
+        # Чем искать тег в запросе к VK: «с #» (хештег) или «без #» (слово) — настройка
+        # tag_query со страницы «Теги». Режим один на весь прогон.
+        args += ["--tag-query", normalize_tag_query(tag_query)]
     if tag:
         args += ["--tag", tag]
     if tags_file:
@@ -441,16 +485,19 @@ class MassApp:
         )
         for column, (caption, value, note) in enumerate(cards):
             row.columnconfigure(column, weight=1, uniform="cards")
-            self._card(row, column, caption, value, note)
+            label = self._card(row, column, caption, value, note)
+            if column == 0:
+                # Подпись первой карточки меняется после «Обнулить счётчики»:
+                # «Постов в базе» → «Постов с обнуления» (см. refresh_all).
+                self.posts_cap = label
 
-    def _card(self, parent, column: int, caption: str, value, note) -> None:
+    def _card(self, parent, column: int, caption: str, value, note):
         card = tk.Frame(parent, bg=THEME["card"], highlightbackground=THEME["border"], highlightthickness=1)
         card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 10, 0))
         box = tk.Frame(card, bg=THEME["card"], padx=14, pady=10)
         box.pack(fill="both", expand=True)
-        tk.Label(box, text=caption, bg=THEME["card"], fg=THEME["muted"], font=(FONTS["ui"], 10)).pack(
-            anchor="w"
-        )
+        cap = tk.Label(box, text=caption, bg=THEME["card"], fg=THEME["muted"], font=(FONTS["ui"], 10))
+        cap.pack(anchor="w")
         tk.Label(
             box, textvariable=value, bg=THEME["card"], fg=THEME["text"], font=(FONTS["ui"], 20, "bold")
         ).pack(anchor="w")
@@ -463,6 +510,7 @@ class MassApp:
             tk.Label(box, textvariable=note, bg=THEME["card"], fg=THEME["muted"], font=(FONTS["ui"], 10)).pack(
                 anchor="w"
             )
+        return cap
 
     # навигация
     def _build_body(self) -> None:
@@ -545,13 +593,16 @@ class MassApp:
         form.pack(fill="x")
         self.period_var = tk.StringVar(value=PERIODS[0][0])
         ttk.Label(form, text="Период:", style="Card.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(
+        period_box = ttk.Combobox(
             form,
             textvariable=self.period_var,
             values=[p[0] for p in PERIODS],
             width=16,
             state="readonly",
-        ).grid(row=0, column=1, sticky="w", padx=(6, 20))
+        )
+        # Период — что собирать; «Работать, ч» подставляем по нему (как в панели браузера).
+        period_box.bind("<<ComboboxSelected>>", lambda _event: self._sync_duty_with_period())
+        period_box.grid(row=0, column=1, sticky="w", padx=(6, 20))
         self.passes_var = tk.StringVar(value=str(self.settings.get("repeat_passes", 1)))
         ttk.Label(form, text="Проходов:", style="Card.TLabel").grid(row=0, column=2, sticky="w")
         ttk.Spinbox(form, from_=1, to=20, textvariable=self.passes_var, width=5).grid(
@@ -568,13 +619,52 @@ class MassApp:
             form, text="проверить аккаунты перед стартом", variable=self.validate_var
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(12, 0))
         self.full_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(form, text="пройти период заново (--full)", variable=self.full_var).grid(
+        ttk.Checkbutton(form, text="перепроверить весь период (--full)", variable=self.full_var).grid(
             row=1, column=2, columnspan=2, sticky="w", pady=(12, 0)
         )
         self.dry_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(form, text="примерка (не писать в базу)", variable=self.dry_var).grid(
             row=1, column=4, columnspan=2, sticky="w", pady=(12, 0)
         )
+        self.nofresh_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            form,
+            text="не перепроверять собранные часы (--no-refresh)",
+            variable=self.nofresh_var,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        # Браузер по умолчанию работает скрыто: галочка показывает его окна —
+        # окно обхода ленты (видно, какое окно времени берётся) и окно эмулятора,
+        # когда он освежает сессию через F5 и меняет cookies на свежий токен.
+        self.show_var = tk.BooleanVar(value=bool(self.settings.get("show_browser", False)))
+        ttk.Checkbutton(
+            form,
+            text="показывать браузер (--show-browser)",
+            variable=self.show_var,
+        ).grid(row=2, column=3, columnspan=3, sticky="w", pady=(4, 0))
+
+        # Период — это ЧТО собирать, а не сколько работать: «за 6 часов» на коротком
+        # периоде пролетает за минуту. Сколько работать, задаёт «Работать, ч» (в панели
+        # браузера поле заполняется по периоду): столько часов от «Старт» процесс
+        # добирает новые посты; как часто проверять — «Пауза, с».
+        self.duty_var = tk.StringVar(value=AUTO_DUTY_HOURS.get(self.period_var.get(), "0"))
+        ttk.Label(form, text="Работать, ч:", style="Card.TLabel").grid(
+            row=3, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Spinbox(form, from_=0, to=720, textvariable=self.duty_var, width=5).grid(
+            row=3, column=1, sticky="w", padx=(6, 20), pady=(8, 0)
+        )
+        self.pause_var = tk.StringVar(value=str(self.settings.get("repeat_pause_sec", 30)))
+        ttk.Label(form, text="Пауза, с:", style="Card.TLabel").grid(
+            row=3, column=2, sticky="w", pady=(8, 0)
+        )
+        ttk.Spinbox(form, from_=10, to=3600, textvariable=self.pause_var, width=6).grid(
+            row=3, column=3, sticky="w", padx=(6, 20), pady=(8, 0)
+        )
+        ttk.Label(
+            form,
+            text="0 — один проход; поле заполняется по периоду, например «за 6 часов» → 6",
+            style="Hint.TLabel",
+        ).grid(row=3, column=4, columnspan=2, sticky="w", pady=(8, 0))
 
         tags_row = tk.Frame(box, bg=THEME["card"])
         tags_row.pack(fill="x", pady=(14, 0))
@@ -617,12 +707,40 @@ class MassApp:
         ttk.Button(top, text="Вернуть тег в очередь", command=self.reset_selected_tag).pack(
             side="left"
         )
-        ttk.Button(top, text="Открыть tags.txt", command=lambda: open_path(TAGS_FILE)).pack(
+        ttk.Button(top, text="Обнулить счётчики", command=self.reset_tag_counters).pack(
             side="left", padx=6
+        )
+        ttk.Button(top, text="Открыть tags.txt", command=lambda: open_path(TAGS_FILE)).pack(
+            side="left"
         )
         ttk.Label(
             top, text="двойной клик по тегу — тоже вернуть в очередь", style="Hint.TLabel"
         ).pack(side="right")
+
+        # Чем искать тег в запросе к VK. Хештег (#тег) и слово без решётки — у VK это
+        # РАЗНЫЕ выдачи, поэтому выбор стоит рядом с тегами и действует на весь прогон:
+        # значение уходит в data/settings.json (tag_query) и оттуда — в --tag-query.
+        pick = tk.Frame(frame, bg=THEME["card"], padx=12, pady=8)
+        pick.pack(fill="x", pady=(8, 0))
+        ttk.Label(pick, text="Искать тег:", style="Card.TLabel").pack(side="left")
+        self.tag_query_var = tk.StringVar(
+            value=TAG_QUERY_LABELS[normalize_tag_query(self.settings.get("tag_query", "hash"))]
+        )
+        picker = ttk.Combobox(
+            pick,
+            textvariable=self.tag_query_var,
+            values=tuple(TAG_QUERY_LABELS.values()),
+            state="readonly",
+            width=18,
+        )
+        picker.pack(side="left", padx=6)
+        picker.bind("<<ComboboxSelected>>", lambda _e: self.save_tag_query())
+        ttk.Label(
+            pick,
+            text="«с #» — посты с хештегом, «без #» — где тег встречается в тексте словом "
+                 "(другая выдача)",
+            style="Hint.TLabel",
+        ).pack(side="left", padx=6)
 
         cols = ("query", "status", "items", "pages", "open", "updated")
         heads = ("Тег", "Состояние", "Постов", "Страниц", "Окон в работе", "Обновлён")
@@ -766,14 +884,25 @@ class MassApp:
 
         stats = self.db.stats()
         posts = int(stats["posts"])
+        # «Обнулить счётчики» ставит отметку отсчёта (counter_mark): карточка считает
+        # с нуля, а сами посты остаются в базе — поэтому второе число («всего в базе»)
+        # видно в подписи, а строка «постов N · теги …» показывает всю базу.
+        since_reset = float(stats["counter_reset_at"] or 0) > 0
         finished = int(stats["tags_finished"])
         total = int(stats["tags_total"])
         self.stats_var.set(
             f"постов {posts} · теги {finished}/{total} · аккаунты: работает {summary[READY]}, "
             f"отлёжка {summary[HOLD]}, мёртв {summary[DEAD]}"
         )
-        self.posts_value.set(str(posts))
-        self.posts_caption.set(f"+{int(stats['posts_last_hour'])} за последний час")
+        self.posts_cap.configure(
+            text="Постов с обнуления" if since_reset else "Постов в базе"
+        )
+        self.posts_value.set(str(int(stats["posts_since_reset"])))
+        note = (
+            f"+{int(stats['posts_last_hour'])} за последний час · "
+            f"ссылок {int(stats['tag_links_since_reset'])}"
+        )
+        self.posts_caption.set(note + (f" · всего в базе {posts}" if since_reset else ""))
         self.tags_value.set(f"{finished} / {total}")
         self.acc_value.set(str(len(rows)))
         self.acc_caption.set(
@@ -899,7 +1028,7 @@ class MassApp:
             "errors": "replace",
             "bufsize": 1,
         }
-        if os.name == "nt":  # чтобы «Стоп» умел послать Ctrl+Break
+        if IS_WINDOWS:  # чтобы «Стоп» умел послать Ctrl+Break
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         return subprocess.Popen(cmd, **kwargs)
 
@@ -935,27 +1064,71 @@ class MassApp:
             self.state_pill.configure(bg="#e6f3ec", fg=THEME["ok"])
             self.log_state.configure(text="ожидание", fg=THEME["console_dim"])
 
+    def _sync_duty_with_period(self) -> None:
+        """Подставить «Работать, ч» по выбранному периоду (как в панели браузера).
+
+        «за 6 часов» → работать 6 ч от «Старт»: период — это ЧТО собирать, а сколько
+        работать задаёт это поле. Дольше суток по умолчанию не подставляем (см.
+        AUTO_DUTY_HOURS), остальное вписывается руками.
+        """
+        self.duty_var.set(AUTO_DUTY_HOURS.get(self.period_var.get(), "0"))
+
+    def save_tag_query(self) -> None:
+        """Сохраняет выбор «с #» / «без #» — новая настройка tag_query.
+
+        Пишем сразу в data/settings.json: то же значение читают панель в браузере и
+        сам прогон (--tag-query из настроек), и режим должен быть один на весь прогон.
+        """
+        mode = tag_query_value(self.tag_query_var.get())
+        self.settings["tag_query"] = mode
+        try:
+            save_settings(self.settings)
+        except OSError as exc:
+            self.log(f"настройки не сохранились: {exc}")
+            return
+        self.log(f"тег в запросе: {TAG_QUERY_LABELS[mode]}")
+
     def start(self) -> None:
         workers = self._int(self.workers_var, self.settings.get("max_accounts", 2))
         passes = self._int(self.passes_var, 1)
         hours = dict(PERIODS).get(self.period_var.get(), 0.0)
+        duty_hours = max(0.0, self._float(self.duty_var, 0.0))
+        saved_pause = int(self.settings.get("repeat_pause_sec", 30))
+        pause = self._int(self.pause_var, saved_pause)
         tags_file = Path(self.tags_file_var.get().strip() or TAGS_FILE)
 
         self.settings["max_accounts"] = max(1, workers)
         self.settings["repeat_passes"] = max(1, passes)
+        # Показ окна эмулятора — настройка show_browser: её же читает панель в браузере
+        # и сам прогон (--show-browser приходит из значения галочки).
+        self.settings["show_browser"] = bool(self.show_var.get())
+        # Чем искать тег в запросе к VK — настройка tag_query со страницы «Теги»:
+        # «с #» (хештег) или «без #» (слово). Сохраняем перед стартом, чтобы прогон
+        # получил именно то, что выбрано в окне.
+        self.settings["tag_query"] = tag_query_value(self.tag_query_var.get())
+        if duty_hours <= 0:
+            self.settings["repeat_pause_sec"] = max(0, pause)
         try:
             save_settings(self.settings)
         except OSError as exc:
             self.log(f"настройки не сохранились: {exc}")
 
+        if duty_hours > 0:
+            # Сколько работать, задаёт время, а не число проходов.
+            passes = 1
         args = build_run_args(
             hours=hours,
             passes=passes,
             workers=workers,
             validate_first=bool(self.validate_var.get()),
             full=bool(self.full_var.get()),
+            no_refresh=bool(self.nofresh_var.get()),
             dry_run=bool(self.dry_var.get()),
+            run_hours=duty_hours,
+            repeat_pause=pause,
             tags_file=tags_file,
+            show_browser=bool(self.show_var.get()),
+            tag_query=self.settings["tag_query"],
         )
         self._run_cli("run_tags", args, "прогон")
 
@@ -966,14 +1139,14 @@ class MassApp:
             return
         self.log(f"останавливаю {self.proc_label} — прогресс сохраняется…")
         try:
-            if os.name == "nt":
+            if IS_WINDOWS:
                 proc.send_signal(signal.CTRL_BREAK_EVENT)
             else:
-                proc.send_signal(signal.SIGINT)
+                proc.send_signal(signal.SIGINT)  # Linux/macOS: обычный Ctrl+C
         except Exception as exc:  # noqa: BLE001
             self.log(f"не получилось послать Ctrl+C ({exc}) — завершаю процесс")
             proc.terminate()
-        self.root.after(15000, self._force_kill)
+        self.root.after(7500, self._force_kill)
 
     def _force_kill(self) -> None:
         proc = self.proc
@@ -996,11 +1169,9 @@ class MassApp:
 
     def reset_selected_tag(self) -> None:
         """Возвращает выбранный тег в очередь: следующий старт соберёт его заново."""
-        selection = self.tag_tree.selection()
-        if not selection:
-            messagebox.showinfo("Теги", "выберите тег в таблице")
+        tag = self._selected_tag()
+        if tag is None:
             return
-        tag = str(self.tag_tree.item(selection[0], "values")[0])
         if not messagebox.askyesno(
             "Теги",
             f"Вернуть тег «{tag}» в очередь?\n\n"
@@ -1015,6 +1186,46 @@ class MassApp:
             return
         self.log(f"тег «{tag}» вернулся в очередь (сброшено записей: {count})")
         self.refresh_all(force=True)
+
+    def reset_tag_counters(self) -> None:
+        """Обнуляет счётчики выбранного тега: Постов/Страниц/Проходов → 0.
+
+        «Вернуть тег в очередь» сбрасывает состояние и курсор, а накопленные цифры
+        остаются историей за всё время — они только растут (bump_tag). Эта кнопка
+        обнуляет только счётчики: статус, курсор и собранные посты не трогаются.
+        Заодно сдвигается отсчёт карточки «Постов в базе» (state_db.counter_mark):
+        цифры начинаются с нуля, посты в базе остаются — «всего в базе» видно
+        в подписи карточки.
+        """
+        tag = self._selected_tag()
+        if tag is None:
+            return
+        if not messagebox.askyesno(
+            "Теги",
+            f"Обнулить счётчики тега «{tag}»?\n\n"
+            "«Постов», «Страниц» и «Проходов» станут нулями.\n"
+            "Карточка «Постов в базе» тоже начнёт считать с нуля.\n"
+            "Статус и курсор тега не меняются, собранные посты остаются в базе.",
+        ):
+            return
+        try:
+            count = self.db.reset_tag_stats([tag])
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Теги", f"не получилось обнулить счётчики «{tag}»: {exc}")
+            return
+        self.log(
+            f"счётчики тега «{tag}» обнулены (сброшено записей: {count}); "
+            "карточка «Постов в базе» считает с нуля"
+        )
+        self.refresh_all(force=True)
+
+    def _selected_tag(self) -> Optional[str]:
+        """Тег из выбранной строки таблицы тегов (None — ничего не выбрано)."""
+        selection = self.tag_tree.selection()
+        if not selection:
+            messagebox.showinfo("Теги", "выберите тег в таблице")
+            return None
+        return str(self.tag_tree.item(selection[0], "values")[0])
 
     # диалоги
     def pick_tags_file(self) -> None:
@@ -1067,7 +1278,7 @@ class MassApp:
         head.pack(fill="x")
         tk.Label(
             head,
-            text="По одной строке на аккаунт:  телефон;пароль;2FA;прокси\n"
+            text="Строка: телефон;пароль;2FA;прокси  или  LOGIN:PASS:TOKEN\n"
             "2FA и прокси необязательны; пустой прокси — берётся из proxies.txt",
             justify="left",
             bg=THEME["card"],
@@ -1097,15 +1308,14 @@ class MassApp:
             if not keep:
                 return
             try:
-                with ACCOUNTS_FILE.open("a", encoding="utf-8") as fh:
-                    fh.write("\n" + "\n".join(keep) + "\n")
+                added, updated, unchanged = upsert_accounts(ACCOUNTS_FILE, keep)
             except OSError as exc:
                 messagebox.showerror("Аккаунты", f"не удалось записать {ACCOUNTS_FILE}: {exc}")
                 return
             loaded = load_accounts()
             self.log(
-                f"{ACCOUNTS_FILE.name}: дописано строк {len(keep)}, "
-                f"всего аккаунтов в файле {len(loaded)}"
+                f"{ACCOUNTS_FILE.name}: новых {added}, обновлено {updated}, "
+                f"уже были {unchanged}, всего уникальных {len(loaded)}"
             )
             self.refresh_all(force=True)
             win.destroy()
@@ -1131,6 +1341,14 @@ class MassApp:
         except (ValueError, AttributeError):
             return int(default)
 
+    @staticmethod
+    def _float(var, default: float) -> float:
+        """«6» и «6,5» из поля — одно и то же (часы работы пишут как удобно)."""
+        try:
+            return float(str(var.get()).strip().replace(",", "."))
+        except (ValueError, AttributeError):
+            return float(default)
+
     def on_close(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
             if not messagebox.askyesno("Выход", "Прогон ещё идёт. Остановить и выйти?"):
@@ -1142,11 +1360,11 @@ class MassApp:
 # Точка входа
 def launcher_hint() -> str:
     """Что доустановить, если в Python нет Tk."""
-    if sys.platform == "darwin":
+    if IS_MACOS:
         return "brew install python-tk"
-    if sys.platform.startswith("win"):
+    if IS_WINDOWS:
         return "переустановите Python с галочкой «tcl/tk and IDLE»"
-    return "sudo apt install python3-tk"
+    return "sudo apt install python3-tk   # Debian/Ubuntu (или пакет tk в своём дистрибутиве)"
 
 
 def main(argv: Optional[list[str]] = None) -> int:
