@@ -68,6 +68,7 @@ from paths import (  # noqa: E402
     BASE_DIR,
     DATA_DIR,
     EXPORTS_DIR,
+    LOG_DIR,
     PROFILE_DIR,
     PROXIES_FILE,
     TAGS_FILE,
@@ -91,6 +92,79 @@ WEB_DIR = SRC_DIR / "webui"
 HOST = "127.0.0.1"  # по умолчанию панель видна только с этого компьютера
 DEFAULT_PORT = 8787
 LOG_TAIL = 4000  # сколько строк лога держим в буфере
+LOG_FILE_MAX_BYTES = 8 * 1024 * 1024  # больше — заводим следующий файл
+
+
+class LogFile:
+    """Копия лога на диск: `data/logs/panel-YYYYmmdd.log` (потом `-2`, `-3`…).
+
+    Буфер панели живёт в памяти и пропадает при перезапуске — а разбирать «что было
+    перед остановкой» приходится уже потом, когда окно закрыто. Пишем те же строки
+    в файл: он лежит в `data/logs/` (каталог в `.gitignore`, логи не попадут в git)
+    и режется по размеру, чтобы не расти бесконечно. Ошибки диска лог не роняют:
+    панель важнее файла.
+    """
+
+    def __init__(
+        self,
+        log_dir: Optional[Path] = None,
+        prefix: str = "panel",
+        max_bytes: int = LOG_FILE_MAX_BYTES,
+    ) -> None:
+        self.dir = Path(log_dir) if log_dir is not None else LOG_DIR
+        self.prefix = prefix
+        self.max_bytes = max(64 * 1024, int(max_bytes))  # мельче не режем: одни огрызки
+        self._lock = threading.Lock()
+        self._fh = None
+        self._size = 0
+        self._part = 1
+        self.path = self._name()
+
+    def _name(self) -> Path:
+        stamp = time.strftime("%Y%m%d")
+        suffix = "" if self._part == 1 else f"-{self._part}"
+        return self.dir / f"{self.prefix}-{stamp}{suffix}.log"
+
+    def write(self, line: str) -> None:
+        text = line if line.endswith("\n") else line + "\n"
+        with self._lock:
+            try:
+                if self._fh is None:
+                    self._open()
+                handle = self._fh
+                if handle is None:
+                    return
+                handle.write(text)
+                handle.flush()  # лог нужен сразу: процесс могут убить
+                self._size += len(text.encode("utf-8", "replace"))
+                if self._size >= self.max_bytes:
+                    self._rotate()
+            except OSError:
+                self.close()
+
+    def _open(self) -> None:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.path = self._name()
+        self._fh = open(self.path, "a", encoding="utf-8", errors="replace")
+        try:
+            self._size = self.path.stat().st_size
+        except OSError:
+            self._size = 0
+
+    def _rotate(self) -> None:
+        self.close()
+        self._part += 1
+        self.path = self._name()
+
+    def close(self) -> None:
+        handle, self._fh = self._fh, None
+        self._size = 0
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
 
 _panel_db: Optional[DB] = None
 _panel_db_lock = threading.Lock()
@@ -123,13 +197,15 @@ RUN_LABEL = "прогон"  # метка процесса сбора: по не�
 class Runner:
     """Один процесс за раз: запуск, поток чтения вывода, буфер строк для лога."""
 
-    def __init__(self) -> None:
+    def __init__(self, log_file: Optional[LogFile] = None) -> None:
         self._lock = threading.Lock()
         self.proc: Optional[subprocess.Popen] = None
         self.label = ""
         self.started_at = 0.0
         self._lines: deque = deque(maxlen=LOG_TAIL)
         self._seq = 0
+        # Лог панели дублируем в файл: буфер в памяти пропадает с перезапуском.
+        self.log_file = log_file if log_file is not None else LogFile()
 
     # лог
     def log(self, msg: str) -> None:
@@ -139,6 +215,7 @@ class Runner:
         with self._lock:
             self._seq += 1
             self._lines.append((self._seq, line))
+        self.log_file.write(line)
 
     def tail(self, after: int) -> tuple[list[str], int]:
         """Строки после номера after: панель забирает только новое."""
@@ -179,6 +256,9 @@ class Runner:
     def spawn(self, cmd: list, label: str) -> tuple[bool, str]:
         if self.running:
             return False, "уже идёт другой процесс — дождитесь конца или нажмите «Стоп»"
+        # Разделитель с датой: по файлу лога видно, где кончился прошлый запуск.
+        self._push("=" * 70)
+        self._push(f"[{time.strftime('%d.%m.%Y %H:%M:%S')}] панель: старт «{label}»")
         self.log("$ " + " ".join(str(part) for part in cmd))
         try:
             proc = self._popen([str(part) for part in cmd])
@@ -264,6 +344,7 @@ def status_payload(runner: Runner, port: int) -> dict:
         "periods": [{"label": label, "hours": hours} for label, hours in PERIODS],
         "events": EVENT_LEVELS,
         "port": port,
+        "log_file": str(runner.log_file.path),
     }
 
 

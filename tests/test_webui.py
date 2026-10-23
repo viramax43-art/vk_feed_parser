@@ -85,6 +85,9 @@ httpd.RequestHandlerClass.runner = FakeRunner()
 editable_before = dict(webui.EDITABLE)
 webui.EDITABLE = {name[:-4]: tmp / name for name in ("tags.txt", "accounts.txt", "proxies.txt")}
 webui.ACCOUNTS_FILE = tmp / "accounts.txt"
+# Лог панели — тоже в tmp: тест не должен писать в настоящий data/logs/.
+real_log_dir = webui.LOG_DIR
+webui.LOG_DIR = tmp / "logs"
 # База панели — тоже временная: тест не читает и не пишет настоящую data/parser.sqlite3,
 # а статусы аккаунтов (например «мёртв — протух токен») готовятся прямо здесь.
 panel_db_before = webui.panel_db
@@ -570,6 +573,8 @@ try:
     check(not live.running, "процесс остановлен")
     lines = [line for _seq, line in live._lines]
     check(any("пошёл" in line for line in lines), "вывод процесса попал в лог панели")
+    log_text = live.log_file.path.read_text(encoding="utf-8")
+    check("пошёл" in log_text, f"лог прогона сохранён в файл: {live.log_file.path.name}")
     check(any("останавливаю" in line for line in lines), "в логе видно, что нажали «Стоп»")
     code, payload = call("/api/stop", "POST", {})
     check(not payload["ok"], f"«Стоп» без прогона честно отказывает: {payload['message']}")
@@ -592,6 +597,7 @@ finally:
         live.stop()
     webui.EDITABLE = editable_before
     webui.ACCOUNTS_FILE = ACCOUNTS_FILE
+    webui.LOG_DIR = real_log_dir
     webui.panel_db = panel_db_before
     settings_mod.CONFIG_FILE = real_config
     paths_mod.DATA_DIR = real_data_dir
