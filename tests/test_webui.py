@@ -80,14 +80,14 @@ class FakeRunner(webui.Runner):
 
 
 port = webui.pick_port(webui.DEFAULT_PORT + 501)
+# Лог панели — в tmp: раннер создаётся в build_server, поэтому подменяем каталог до него.
+real_log_dir = webui.LOG_DIR
+webui.LOG_DIR = tmp / "logs"
 httpd, _real_runner = webui.build_server(port)
 httpd.RequestHandlerClass.runner = FakeRunner()
 editable_before = dict(webui.EDITABLE)
 webui.EDITABLE = {name[:-4]: tmp / name for name in ("tags.txt", "accounts.txt", "proxies.txt")}
 webui.ACCOUNTS_FILE = tmp / "accounts.txt"
-# Лог панели — тоже в tmp: тест не должен писать в настоящий data/logs/.
-real_log_dir = webui.LOG_DIR
-webui.LOG_DIR = tmp / "logs"
 # База панели — тоже временная: тест не читает и не пишет настоящую data/parser.sqlite3,
 # а статусы аккаунтов (например «мёртв — протух токен») готовятся прямо здесь.
 panel_db_before = webui.panel_db
