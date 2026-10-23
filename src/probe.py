@@ -27,7 +27,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from accounts import load_accounts, normalize_proxy, resolve_proxy  # noqa: E402
+from accounts import load_accounts, normalize_proxy, proxy_host_port, resolve_proxy  # noqa: E402
 from paths import LOG_DIR, SESSION_FILE  # noqa: E402
 from settings import TAG_QUERY_LABELS, load_settings  # noqa: E402
 from state_db import DB  # noqa: E402
@@ -389,7 +389,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         log(f"нет доступа к VK API: {exc}")
         log("сначала выполните вход: python src/vk_auth.py --login")
         return 1
-    log(f"сессия: {client.login or '—'}, прокси: {client.proxy or '—'}")
+    log(f"сессия: {client.login or '—'}, прокси: {proxy_host_port(client.proxy) or '—'}")
     if mode == "auto":
         # Авто-режим: проба одного тега — самое место проверить оба запроса и
         # показать, где выдача больше (в прогоне это делает run_tags.tag_mode_for).

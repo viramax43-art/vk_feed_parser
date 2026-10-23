@@ -87,6 +87,7 @@ from platform_compat import (  # noqa: E402
     can_open_browser,
     os_label,
 )
+from redact import redact  # noqa: E402
 
 WEB_DIR = SRC_DIR / "webui"
 HOST = "127.0.0.1"  # по умолчанию панель видна только с этого компьютера
@@ -103,6 +104,9 @@ class LogFile:
     в файл: он лежит в `data/logs/` (каталог в `.gitignore`, логи не попадут в git)
     и режется по размеру, чтобы не расти бесконечно. Ошибки диска лог не роняют:
     панель важнее файла.
+
+    Секреты (cookies, токены, пароли прокси, телефон) сюда уже приходят
+    замаскированными: их вычищает `Runner._push` через src/redact.py.
     """
 
     def __init__(
@@ -212,6 +216,10 @@ class Runner:
         self._push(f"[{time.strftime('%H:%M:%S')}] панель: {msg}")
 
     def _push(self, line: str) -> None:
+        # Одна точка на весь лог: и буфер панели, и файл получают строку без
+        # cookies/токенов/паролей прокси (см. src/redact.py). Вывод процесса
+        # приходит сюда же, поэтому чистить каждую команду отдельно не нужно.
+        line = redact(line)
         with self._lock:
             self._seq += 1
             self._lines.append((self._seq, line))

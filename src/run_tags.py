@@ -97,6 +97,7 @@ from paths import ACCOUNTS_FILE, EXPORTS_DIR, SESSION_FILE, TAGS_FILE  # noqa: E
 from platform_compat import has_display, os_label  # noqa: E402
 from proxy_stock import swap_account_proxy  # noqa: E402
 from settings import TAG_QUERY_LABELS, load_settings, normalize_tag_query  # noqa: E402
+from redact import redact  # noqa: E402
 from state_db import DB  # noqa: E402
 from vk_client import (  # noqa: E402
     MODE_PROBE_HOURS,
@@ -963,7 +964,8 @@ class SessionRefresher(threading.Thread):
                 try:
                     payload = refresh_from_cookies(Path(acc.session_path), acc.proxy) or {}
                 except Exception as exc:  # noqa: BLE001 — сеть, прокси, «too much tries»
-                    errors.append(f"cookies: {exc}")
+                    # В тексте ошибки Playwright печатает запрос с cookie сессии.
+                    errors.append(f"cookies: {redact(str(exc))}")
                     if self._throttled(str(exc)):
                         # VK режет чистый HTTP-обмен: дальше этот аккаунт обновляем
                         # лентой в профиле браузера (F5) — она идёт мимо ограничения.

@@ -82,6 +82,7 @@ from accounts import (  # noqa: E402
     Account,
     load_accounts,
     normalize_proxy,
+    proxy_host_port,
     proxy_to_playwright,
     resolve_proxy,
 )
@@ -103,6 +104,7 @@ from platform_compat import (  # noqa: E402
     private_file,
 )
 from settings import normalize_tag_query  # noqa: E402
+from redact import redact  # noqa: E402
 from user_agents import (  # noqa: E402
     impersonate_for,
     is_mobile,
@@ -312,7 +314,9 @@ VIEW_NOISE_HOSTS = (
 
 
 def log(msg: str) -> None:
-    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    # В лог входа попадают cookie из ошибок Playwright и адрес прокси — чистим здесь,
+    # чтобы строки не ушли в панель/файл как есть (см. src/redact.py).
+    line = f"[{time.strftime('%H:%M:%S')}] {redact(msg)}"
     try:
         print(line, flush=True)
     except Exception:  # noqa: BLE001
@@ -486,7 +490,8 @@ def request_web_token_http(
             )
             payload = resp.json()
         except Exception as exc:  # noqa: BLE001
-            errors.append(f"{url}: {exc}")
+            # Playwright в тексте ошибки печатает запрос целиком, вместе с `cookie:`.
+            errors.append(f"{url}: {redact(str(exc))}")
             continue
         if not isinstance(payload, dict):
             errors.append(f"{url}: не JSON")
@@ -1166,7 +1171,7 @@ def login_interactive(
 
     os.environ["VK_AUTH_PROXY"] = proxy
     log(f"профиль браузера: {profile_dir}")
-    log(f"прокси: {proxy or '— (напрямую)'}")
+    log(f"прокси: {proxy_host_port(proxy) or '— (напрямую)'}")
     log(f"аккаунт: {login or '— (вход вручную)'}")
     if password_only:
         log(
@@ -1199,9 +1204,10 @@ def login_interactive(
                 _screenshot(page, "vk_login_blank.png")
                 raise VkAuthError(
                     "страница входа VK не открылась: окно осталось на about:blank. "
-                    f"Обычно это прокси аккаунта (прокси: {proxy or '—'}): соединения нет "
+                    f"Обычно это прокси аккаунта (прокси: {proxy_host_port(proxy) or '—'}): "
+                    "соединения нет "
                     "или туннель обрывается — проверьте прокси и повторите вход. "
-                    f"Последняя ошибка: {page_error or 'окно пустое'}"
+                    f"Последняя ошибка: {redact(str(page_error or 'окно пустое'))}"
                 )
             if not opened:
                 log("профиль уже вошёл — страница входа не понадобилась")
@@ -1263,8 +1269,8 @@ def login_interactive(
                         _screenshot(page, "vk_login_blank.png")
                         raise VkAuthError(
                             "окно VK так и осталось на about:blank: прокси "
-                            f"{proxy or '—'} не открывает страницу входа. Смените прокси "
-                            "аккаунта и повторите вход"
+                            f"{proxy_host_port(proxy) or '—'} не открывает страницу входа. "
+                            "Смените прокси аккаунта и повторите вход"
                         )
                     if _page_is_blank(page):
                         time.sleep(1.5)
@@ -1534,7 +1540,8 @@ def _web_token_from_browser(context) -> dict:
             )
             payload = resp.json()
         except Exception as exc:  # noqa: BLE001
-            errors.append(f"{url}: {exc}")
+            # В ошибке Chromium тоже бывают заголовки запроса с cookie сессии.
+            errors.append(f"{url}: {redact(str(exc))}")
             continue
         if isinstance(payload, dict) and payload.get("type") == "okay":
             data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
@@ -1645,7 +1652,7 @@ def token_via_feed_reload(
     if pw_proxy:
         launch["proxy"] = pw_proxy
     log(f"профиль браузера (F5): {profile_dir}")
-    log(f"прокси: {proxy or '— (напрямую)'}")
+    log(f"прокси: {proxy_host_port(proxy) or '— (напрямую)'}")
     if not headless:
         log(
             "браузер открыт на виду: зайду в ленту и обновлю её через F5 — "
@@ -2407,7 +2414,7 @@ def _print_status(session_path: Path = SESSION_FILE) -> int:
         f"cookies:   {len(cookies)} шт, "
         f"remixsid={'да' if has_login_cookie(cookies) else 'нет'}"
     )
-    print(f"прокси:    {data.get('proxy') or '—'}")
+    print(f"прокси:    {proxy_host_port(data.get('proxy') or '') or '—'}")
     print(f"обновлено: {data.get('updated_at') or '—'}")
     return 0
 
